@@ -1,0 +1,221 @@
+<?php
+/*
+ *  This file is a part of small-swoole-db
+ *  Copyright 2024 - Sébastien Kus
+ *  Under GNU GPL V3 licence
+ */
+
+namespace Small\SwooleDb\Core\Index;
+
+use Small\SwooleDb\Core\Column;
+use Small\SwooleDb\Core\Enum\ColumnType;
+use Small\SwooleDb\Core\Enum\ForeignKeyType;
+use Small\SwooleDb\Core\Record;
+use Small\SwooleDb\Core\RecordCollection;
+use Small\SwooleDb\Core\Resultset;
+use Small\SwooleDb\Core\Table;
+use Small\SwooleDb\Exception\NotFoundException;
+use Small\SwooleDb\Exception\TableNotExists;
+use Small\SwooleDb\Registry\TableRegistry;
+
+class ForeignKey
+{
+
+    const FOREIGN_KEY_TABLE_PREFIX = '_FOREIGN_KEY_';
+    const FROM_INDEX_TABLE_PREFIX = self::FOREIGN_KEY_TABLE_PREFIX . 'FROM_';
+    const TO_INDEX_TABLE_PREFIX = self::FOREIGN_KEY_TABLE_PREFIX . 'TO_';
+
+    const INDEX_MAX_SIZE = 1048576;
+
+    protected Table $foreignIndex;
+    protected ForeignKey $reflected;
+
+    public function __construct(
+        protected string $keyName,
+        protected string $fromTable,
+        protected string $fromField,
+        protected string $toTable,
+        protected string $toField,
+        protected ForeignKeyType $type,
+    ) {
+
+        switch ($this->type) {
+            case ForeignKeyType::from:
+                $prefix = static::FROM_INDEX_TABLE_PREFIX;
+                break;
+            case ForeignKeyType::to:
+                $prefix = static::TO_INDEX_TABLE_PREFIX;
+                break;
+        }
+
+        try {
+            $this->foreignIndex = TableRegistry::getInstance()->getTable($prefix . $this->fromTable . '_' . $this->keyName);
+        } catch (TableNotExists) {
+            $this->foreignIndex = TableRegistry::getInstance()->createTable($prefix . $this->fromTable . '_' . $this->keyName, self::INDEX_MAX_SIZE);
+            $this->createForeignIndexTable();
+        }
+    }
+
+    public function getReflected(): ForeignKey
+    {
+        return $this->reflected;
+    }
+
+    public function setReflected(ForeignKey $reflected): void
+    {
+        $this->reflected = $reflected;
+    }
+
+
+
+    public function getKeyName(): string
+    {
+        return $this->keyName;
+    }
+
+    public function getFromTable(): string
+    {
+        return $this->fromTable;
+    }
+
+    public function getFromField(): string
+    {
+        return $this->fromField;
+    }
+
+    public function getToTable(): string
+    {
+        return $this->toTable;
+    }
+
+    public function getToField(): string
+    {
+        return $this->toField;
+    }
+
+    public function getType(): ForeignKeyType
+    {
+        return $this->type;
+    }
+
+    public function getToTableName(): string
+    {
+
+        return $this->toTable;
+
+    }
+
+    /**
+     * Create an index table
+     * @return self
+     * @throws \Small\SwooleDb\Exception\MalformedTable
+     */
+    private function createForeignIndexTable(): self
+    {
+
+        $type = ColumnType::string;
+        $size = 256;
+
+        $this->foreignIndex->addColumn(new Column('foreignKey', $type, $size));
+        $this->foreignIndex->addColumn(new Column('valid', ColumnType::int, 1));
+
+        $this->foreignIndex->create();
+
+        return $this;
+
+    }
+
+    /**
+     * Add to "from" index
+     * @param int|float|string|null $value
+     * @param int|float|string|null $foreignKey
+     * @return $this
+     * @throws \Small\SwooleDb\Exception\FieldValueIsNull
+     */
+    public function addToForeignIndex(mixed $value, mixed $foreignKey): self
+    {
+
+        for ($i = 0; $i < self::INDEX_MAX_SIZE; $i++) {
+
+            if (!$this->foreignIndex->exists($value . '_' . $i)) {
+                break;
+            }
+
+            if ($this->foreignIndex->get($value . '_' . $i, 'foreignKey') == $foreignKey) {
+                return $this;
+            }
+
+        }
+
+        $key = $value . '_' . $i;
+        $this->foreignIndex->set($key, ['foreignKey' => $foreignKey, 'valid' => 1]);
+
+        return $this;
+
+    }
+
+    /**
+     * Get foreign record
+     * @param Record $record
+     * @param string|null $alias
+     * @return Resultset
+     * @throws NotFoundException
+     * @throws TableNotExists
+     */
+    public function getForeignRecords(Record $record, string $alias = null): Resultset
+    {
+
+        $value = $record->getKey();
+
+        $resultset = new Resultset();
+        for ($i = 0; $i < self::INDEX_MAX_SIZE; $i++) {
+
+            if ($this->foreignIndex->exists($value . '_' . $i)) {
+
+                $foreignKey = $this->foreignIndex->getRecord($value . '_' . $i);
+
+                if ($foreignKey->getValue('valid') == 1) {
+                    $resultset[] = new RecordCollection([
+                        $alias ?? $this->toTable =>
+                        TableRegistry::getInstance()
+                        ->getTable($this->toTable)
+                        ->getRecord(
+                            is_string($foreignKey->getValue('foreignKey'))
+                            ? $foreignKey->getValue('foreignKey')
+                            : throw new \LogicException('Foreign key must be string')
+                        )
+                    ]);
+                }
+
+            } else {
+                break;
+            }
+
+        }
+
+        return $resultset;
+
+    }
+
+    /**
+     * Delete key from index
+     * @param string|int $value
+     * @return $this
+     * @throws \Small\SwooleDb\Exception\NotFoundException
+     */
+    public function deleteFromForeignIndex(string|int $value): self
+    {
+
+        for ($i = 0; $i < self::INDEX_MAX_SIZE; $i++) {
+            try {
+                $record = $this->foreignIndex->getRecord($value . '_' . $i);
+                $record->setValue('valid', 0);
+                $record->persist();
+            } catch(NotFoundException) {}
+        }
+
+        return $this;
+
+    }
+
+}
